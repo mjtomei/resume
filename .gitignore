@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+dist/
+test-results/
+# Local recovery utility; not part of the installed command or release.
+/retry_remote_panes.py
