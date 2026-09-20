@@ -29,6 +29,7 @@ import tempfile
 import time
 import uuid
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 STATE = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'tmux-resume'
@@ -1279,24 +1280,157 @@ def check_remote_connections(parts):
                            'Then rerun the same tmux-resume restore command.')
 
 
-def restore(tmux, path, data, dry_run=False):
-    check_remote_connections([(path, data)])
-    if dry_run:
-        return restore_locked(tmux, path, data, True)
-    with restore_lock():
-        return restore_locked(tmux, path, data)
+def restore_environment(record):
+    env = dict(os.environ, **record.get('env', {}))
+    for name in record.get('unset', []):
+        env.pop(name, None)
+    return env
 
 
-def restore_all(parts, socket=None, dry_run=False):
-    parts = list(parts)
-    check_remote_connections(parts)
+def codex_version(value):
+    if not isinstance(value, str) or not re.fullmatch(r'\d+\.\d+\.\d+', value):
+        raise ValueError(f'unsupported Codex version: {value!r}')
+    return tuple(map(int, value.split('.')))
+
+
+def latest_codex_version(home):
+    """Use Codex's startup cache; refresh old/missing metadata once per restore."""
+    cache = read_json(home / 'version.json')
+    cached = None
+    if isinstance(cache, dict):
+        try:
+            codex_version(cache.get('latest_version'))
+            cached = cache['latest_version']
+            checked = dt.datetime.fromisoformat(cache['last_checked_at'].replace('Z', '+00:00'))
+            age = dt.datetime.now(dt.timezone.utc) - checked
+            if dt.timedelta(0) <= age < dt.timedelta(hours=20):
+                return cached
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pass
+    try:
+        request = Request('https://api.github.com/repos/openai/codex/releases/latest',
+                          headers={'User-Agent': 'tmux-resume', 'Accept': 'application/vnd.github+json'})
+        with urlopen(request, timeout=3) as response:
+            release = json.loads(response.read(1024 * 1024))
+        latest = release['tag_name'].removeprefix('rust-v')
+        codex_version(latest)
+        # Do not downgrade a newer cached release (e.g. during staged rollout).
+        return max([latest, cached] if cached else [latest], key=codex_version)
+    except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError, AttributeError) as error:
+        if cached:
+            print(f'WARNING: Could not refresh Codex update status; using cached version {cached} from {home}.')
+            return cached
+        raise ValueError('cannot determine the latest Codex version (no usable cache and update lookup failed)') from error
+
+
+def check_codex_updates(parts, skip=False):
+    checked, latest_by_home, failures = {}, {}, []
+    if skip:
+        return
+    for _, data in parts:
+        for window in data['windows'].values():
+            for pane in window['panes']:
+                record = pane['restore']
+                if not record['kind'].startswith('codex') or not record.get('argv'):
+                    continue
+                env = restore_environment(record)
+                home = Path(env.get('CODEX_HOME') or str(Path.home() / '.codex'))
+                if not home.is_absolute():
+                    home = Path(record['cwd']) / home
+                executable = record['argv'][0]
+                key = (executable, record['cwd'], tuple(sorted(env.items())))
+                try:
+                    if key not in checked:
+                        try:
+                            result = run([executable, '--version'], cwd=record['cwd'], env=env, timeout=5)
+                            match = re.fullmatch(r'codex-cli (\S+)\s*', result.stdout)
+                            if result.returncode or not match:
+                                raise ValueError(f'cannot determine installed version of {executable}')
+                            codex_version(match[1])
+                            checked[key] = match[1]
+                        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                            checked[key] = error
+                    if isinstance(checked[key], Exception):
+                        raise ValueError(str(checked[key]))
+                    if home not in latest_by_home:
+                        try:
+                            latest_by_home[home] = latest_codex_version(home)
+                        except ValueError as error:
+                            latest_by_home[home] = error
+                    if isinstance(latest_by_home[home], Exception):
+                        raise ValueError(str(latest_by_home[home]))
+                    installed, latest = checked[key], latest_by_home[home]
+                    if codex_version(installed) < codex_version(latest):
+                        failures.append(f"{pane['location']}: {executable} {installed} -> {latest}")
+                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    failures.append(f"{pane['location']}: {error}")
+    if failures:
+        raise RuntimeError('Codex update preflight failed; nothing restored.\n' + '\n'.join(failures) +
+                           '\nInstall the update with `codex update` (or your package manager), then rerun restore. '
+                           'To deliberately restore without updating, use `tmux-resume restore --skip-codex-update`.')
+
+
+def restore_argv(record):
+    argv = record.get('argv')
+    if argv and record['kind'].startswith('codex'):
+        # Central preflight owns update checks. Avoid a new per-pane popup if
+        # the cache changes between preflight and launch, including on retries.
+        override = ['-c', 'check_for_update_on_startup=false']
+        return list(argv) if argv[-2:] == override else argv + override
+    return argv
+
+
+def missing_session_plans(plans):
+    """Exclude existing workspaces before checking or launching their panes."""
+    receipts = active_restores()
+    remaining = []
+    for tmux, path, data in plans:
+        existing = set(tmux.call('list-sessions', '-F', '#{session_name}', allow_fail=True).splitlines())
+        skipped = set()
+        for session in restore_sessions(data):
+            workspace = pm_workspace(session, data)
+            name = session['session_name']
+            matches = sorted(n for n in existing if n == name or (workspace and n.startswith(name + '~')))
+            prior = [r for r in receipts if r['workspace'] == workspace_key(data, session)]
+            if matches or prior:
+                skipped.add(name)
+                reason = ('already exists: ' + ', '.join(matches)) if matches else 'this checkpoint is already restored'
+                destination = tmux.prefix[2] if len(tmux.prefix) > 1 else 'default socket'
+                print(f'Skipping {name} ({destination}): {reason}')
+        names = [s['session_name'] for s in data['sessions']
+                 if ((pm_workspace(s, data) or {}).get('name') or s['session_name']) not in skipped]
+        if names:
+            remaining.append((tmux, path, select_snapshot(data, names) if skipped else data))
+    if not remaining:
+        print('No missing sessions to restore; nothing changed.')
+    return remaining
+
+
+def restore(tmux, path, data, dry_run=False, skip_existing=False, skip_codex_update=False):
+    return restore_plans([(tmux, path, data)], dry_run, skip_existing, skip_codex_update)
+
+
+def restore_all(parts, socket=None, dry_run=False, skip_existing=False, skip_codex_update=False):
     plans = [(Tmux(socket or snapshot_socket(data)), path, data) for path, data in parts]
+    return restore_plans(plans, dry_run, skip_existing, skip_codex_update)
+
+
+def restore_plans(plans, dry_run=False, skip_existing=False, skip_codex_update=False):
     if dry_run:
+        if skip_existing:
+            plans = missing_session_plans(plans)
+        check_remote_connections([(path, data) for _, path, data in plans])
+        check_codex_updates([(path, data) for _, path, data in plans], skip_codex_update)
         for tmux, path, data in plans:
-            print(f'\nServer: {server_name(tmux.prefix[2]) or tmux.prefix[2]} (socket {tmux.prefix[2]})')
+            socket = tmux.prefix[2] if len(tmux.prefix) > 1 else named_socket('default')
+            print(f'\nServer: {server_name(socket) or socket} (socket {socket})')
             restore_locked(tmux, path, data, True)
         return
     with restore_lock():
+        if skip_existing:
+            plans = missing_session_plans(plans)
+        check_remote_connections([(path, data) for _, path, data in plans])
+        check_codex_updates([(path, data) for _, path, data in plans], skip_codex_update)
         # Validate every server before creating even the first placeholder.
         for tmux, path, data in plans:
             restore_locked(tmux, path, data, preflight_only=True)
@@ -1334,7 +1468,7 @@ def restore_locked(tmux, path, data, dry_run=False, preflight_only=False, defer_
                     print(f"{p['location']}: [PM creates this dashboard]")
                     continue
                 r = p['restore']
-                command = shlex.join(r['argv']) if r.get('argv') else '[shell]'
+                command = shlex.join(restore_argv(r)) if r.get('argv') else '[shell]'
                 prefill = prefill_command(p)
                 if prefill:
                     command = '[prefill; waits for Enter] ' + prefill
@@ -1496,11 +1630,8 @@ def run_pane(path, pane_id, shell):
     p = next(p for w in data['windows'].values() for p in w['panes'] if p['pane_id'] == pane_id)
     r = p['restore']
     os.chdir(r['cwd'])
-    env = os.environ.copy()
-    env.update(r.get('env', {}))
-    for k in r.get('unset', []):
-        env.pop(k, None)
-    argv = r.get('argv')
+    env = restore_environment(r)
+    argv = restore_argv(r)
     if r.get('session_file'):
         if r['kind'] == 'emacs':
             argv = [argv[0], '-nw', '--load', str(ROOT / 'tmux-resume.el'), '--load', str(path / r['session_file'])]
@@ -1828,6 +1959,10 @@ def main():
     p = sub.add_parser('restore')
     p.add_argument('snapshot', nargs='?')
     p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--skip-existing', action='store_true',
+                   help='skip existing or already-restored sessions and restore only missing workspaces')
+    p.add_argument('--skip-codex-update', action='store_true',
+                   help='bypass the Codex update preflight and suppress startup update dialogs for this restore')
     p.add_argument('--session', action='append', help='restore only this saved tmux/PM workspace; repeatable')
     p = sub.add_parser('show')
     p.add_argument('snapshot', nargs='?')
@@ -1867,7 +2002,7 @@ def main():
                 print(f'\nServer: {server_name(snapshot_socket(part)) or snapshot_socket(part)} (socket {snapshot_socket(part)})')
                 report(part, part_path)
         else:
-            restore_all(parts, socket, args.dry_run)
+            restore_all(parts, socket, args.dry_run, args.skip_existing, args.skip_codex_update)
         return
     def sources():
         if socket or args.server:

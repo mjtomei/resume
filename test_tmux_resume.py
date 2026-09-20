@@ -84,6 +84,16 @@ class RemotePreflightTests(unittest.TestCase):
     def record(self, endpoint='unix://', **extra):
         return dict(kind='codex', cwd='/tmp', argv=['codex', 'resume', 'thread-id', '--remote', endpoint], **extra)
 
+    def test_local_and_non_codex_sessions_do_not_probe_remote(self):
+        records = [dict(kind='codex', argv=['codex', 'resume', 'thread-id']),
+                   dict(kind='codex', argv=None), dict(kind='shell'),
+                   dict(kind='claude', argv=['claude', '--resume', 'thread-id']),
+                   dict(kind='vim', argv=['vim', 'notes.txt'])]
+        data = {'windows': {'@0': {'panes': [dict(restore=r) for r in records]}}}
+        with mock.patch.object(t, 'probe_remote') as probe:
+            t.check_remote_connections([(Path('/tmp'), data)])
+            probe.assert_not_called()
+
     def test_default_endpoint_uses_saved_home_and_option_values_are_not_flags(self):
         record = self.record(env={'CODEX_HOME': '/saved/codex'})
         self.assertEqual(t.remote_connection(record), ('unix:///saved/codex/app-server-control/app-server-control.sock', None))
@@ -132,6 +142,96 @@ class RemotePreflightTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'nothing restored'):
                     t.restore_all([(Path('/tmp'), dict(data, server='/tmp/test.sock|1|1'))], dry_run=dry_run)
                 build.assert_not_called()
+
+
+class CodexUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='resume-update-')
+        self.root = Path(self.tmp.name)
+        self.home = self.root / 'custom-codex'
+        self.home.mkdir()
+        self.client = self.root / 'codex'
+        self.client.write_text('#!/bin/sh\nprintf "codex-cli 0.155.0\\n"\n')
+        self.client.chmod(0o755)
+        self.record = dict(kind='codex', cwd=str(self.root), env={'CODEX_HOME': str(self.home)},
+                           argv=[str(self.client), 'resume', 'test-thread'])
+        self.data = {'windows': {'@0': {'panes': [dict(location='work:0', restore=self.record)]}}}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_automatic_codex_resumes_means_no_update_checks(self):
+        records = [dict(kind='shell'), dict(kind='vim', argv=['vim', 'notes.txt']),
+                   dict(kind='claude', argv=['claude', '--resume', 'thread-id']),
+                   dict(kind='codex', argv=None)]
+        data = {'windows': {'@0': {'panes': [dict(restore=r) for r in records]}}}
+        with mock.patch.object(t, 'run') as execute, mock.patch.object(t, 'latest_codex_version') as latest:
+            t.check_codex_updates([(self.root, data)])
+            t.check_codex_updates([])
+            execute.assert_not_called()
+            latest.assert_not_called()
+
+    def cache(self, version='0.155.1', stale=False):
+        checked = t.dt.datetime.now(t.dt.timezone.utc) - t.dt.timedelta(hours=21 if stale else 0)
+        t.write_json(self.home / 'version.json', dict(latest_version=version, last_checked_at=checked.isoformat()))
+
+    def test_pending_update_blocks_and_installing_it_clears_guard(self):
+        self.cache()
+        with mock.patch.object(t, 'urlopen', side_effect=AssertionError('fresh cache must not use network')):
+            with self.assertRaisesRegex(RuntimeError, '0.155.0 -> 0.155.1'):
+                t.check_codex_updates([(self.root, self.data)])
+            self.client.write_text('#!/bin/sh\nprintf "codex-cli 0.155.1\\n"\n')
+            t.check_codex_updates([(self.root, self.data)])
+        self.assertEqual(t.read_json(self.home / 'version.json')['latest_version'], '0.155.1')
+
+    def test_version_comparison_numeric_and_newer_installed_is_allowed(self):
+        self.assertGreater(t.codex_version('0.155.10'), t.codex_version('0.155.9'))
+        self.cache('0.99.9')
+        t.check_codex_updates([(self.root, self.data)])
+
+    def test_stale_cache_refreshed_once_for_multiple_panes(self):
+        self.cache(stale=True)
+        self.data['windows']['@0']['panes'].append(dict(location='work:1', restore=self.record))
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"tag_name":"rust-v0.156.0"}'
+        with mock.patch.object(t, 'urlopen', return_value=response) as fetch, mock.patch.object(t, 'run', wraps=t.run) as version:
+            with self.assertRaisesRegex(RuntimeError, '0.156.0'):
+                t.check_codex_updates([(self.root, self.data)])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(version.call_count, 1)
+
+    def test_network_failure_uses_cache_or_requires_explicit_skip(self):
+        self.cache('0.155.0', stale=True)
+        with mock.patch.object(t, 'urlopen', side_effect=OSError('offline')):
+            t.check_codex_updates([(self.root, self.data)])
+            (self.home / 'version.json').unlink()
+            self.data['windows']['@0']['panes'].append(dict(location='work:1', restore=self.record))
+            with mock.patch.object(t, 'urlopen', side_effect=OSError('offline')) as fetch:
+                with self.assertRaisesRegex(RuntimeError, '--skip-codex-update'):
+                    t.check_codex_updates([(self.root, self.data)])
+                self.assertEqual(fetch.call_count, 1)
+        with mock.patch.object(t, 'run', side_effect=AssertionError('bypass must not execute version checks')):
+            t.check_codex_updates([(self.root, self.data)], skip=True)
+
+    def test_suppression_overrides_saved_true_without_mutating_or_growing_snapshot_argv(self):
+        self.record['argv'] += ['-c', 'check_for_update_on_startup=true']
+        original = list(self.record['argv'])
+        actual = t.restore_argv(self.record)
+        self.assertEqual(actual[-2:], ['-c', 'check_for_update_on_startup=false'])
+        self.assertEqual(self.record['argv'], original)
+        self.record['argv'] = actual
+        self.assertEqual(t.restore_argv(self.record), actual)
+        self.record['kind'] = 'claude'
+        self.record['argv'] = ['claude', '--resume', 'thread-id']
+        self.assertEqual(t.restore_argv(self.record), self.record['argv'])
+
+    def test_local_sessions_and_newer_cache_are_not_ignored(self):
+        self.cache('0.156.0', stale=True)
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"tag_name":"rust-v0.155.0"}'
+        with mock.patch.object(t, 'urlopen', return_value=response):
+            with self.assertRaisesRegex(RuntimeError, '0.156.0'):
+                t.check_codex_updates([(self.root, self.data)])
 
 
 class OptionsTests(unittest.TestCase):
@@ -555,6 +655,75 @@ class IntegrationTests(unittest.TestCase):
         finally:
             other.call('kill-server', allow_fail=True)
 
+    def test_skip_existing_restores_missing_session_without_touching_live_pane(self):
+        self.tmux.call('new-session', '-d', '-s', 'missing', '/bin/bash --noprofile --norc')
+        data = self.snapshot()
+        original = json.dumps(data, sort_keys=True)
+        existing = self.tmux.call('list-panes', '-t', 'work', '-F', '#{pane_id}|#{pane_pid}')
+        self.tmux.call('kill-session', '-t', '=missing')
+        with self.assertRaisesRegex(RuntimeError, 'already exist'):
+            t.restore(self.tmux, self.root / 'snap', data)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            t.restore(self.tmux, self.root / 'snap', data, dry_run=True, skip_existing=True)
+        self.assertIn('Skipping work', output.getvalue())
+        self.assertIn('missing:', output.getvalue())
+        self.assertEqual(self.tmux.call('list-sessions', '-F', '#{session_name}'), 'work')
+        t.restore(self.tmux, self.root / 'snap', data, skip_existing=True)
+        self.assertEqual(self.tmux.call('list-sessions', '-F', '#{session_name}').splitlines(), ['missing', 'work'])
+        self.assertEqual(self.tmux.call('list-panes', '-t', 'work', '-F', '#{pane_id}|#{pane_pid}'), existing)
+        before = self.tmux.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}')
+        output = io.StringIO()
+        with redirect_stdout(output):
+            t.restore(self.tmux, self.root / 'snap', data, skip_existing=True)
+        self.assertIn('No missing sessions', output.getvalue())
+        self.assertEqual(self.tmux.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}'), before)
+        self.assertEqual(json.dumps(data, sort_keys=True), original)
+
+    def test_skip_existing_retains_duplicate_agent_guard_for_missing_sessions(self):
+        self.tmux.call('new-session', '-d', '-s', 'missing', '/bin/bash --noprofile --norc')
+        data = self.snapshot()
+        self.tmux.call('kill-session', '-t', '=missing')
+        with mock.patch.object(t, 'live_agent_conflicts', return_value=['conversation already running elsewhere']) as guard:
+            with self.assertRaisesRegex(RuntimeError, 'conversation already running'):
+                t.restore(self.tmux, self.root / 'snap', data, skip_existing=True)
+        self.assertEqual([s['session_name'] for s in guard.call_args.args[0]['sessions']], ['missing'])
+        self.assertEqual(self.tmux.call('list-sessions', '-F', '#{session_name}'), 'work')
+
+    def test_skip_existing_receipt_recognizes_renamed_session_on_another_socket(self):
+        self.tmux.call('new-session', '-d', '-s', 'missing', '/bin/bash --noprofile --norc')
+        data = self.snapshot()
+        self.tmux.call('kill-server')
+        t.restore(self.tmux, self.root / 'snap', t.select_snapshot(data, ['work']))
+        self.tmux.call('rename-session', '-t', '=work', 'renamed')
+        existing = self.tmux.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}')
+        other = t.Tmux(str(self.root / 'other.sock'))
+        try:
+            t.restore(other, self.root / 'snap', data, skip_existing=True)
+            self.assertEqual(other.call('list-sessions', '-F', '#{session_name}'), 'missing')
+            self.assertEqual(self.tmux.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}'), existing)
+        finally:
+            other.call('kill-server', allow_fail=True)
+
+    def test_skip_existing_pm_attachment_skips_entire_workspace(self):
+        base = 'pm-test-12345678'
+        self.tmux.call('rename-session', '-t', 'work', base)
+        self.tmux.call('new-session', '-d', '-s', base + '~1', '-t', base)
+        self.tmux.call('new-session', '-d', '-s', 'missing', '/bin/bash --noprofile --norc')
+        data = self.snapshot()
+        session = next(s for s in data['sessions'] if s['session_name'] == base)
+        pane = data['windows'][session['links'][0]['id']]['panes'][0]
+        pane['restore'] = dict(kind='pm', cwd=str(self.root))
+        t.write_json(self.root / 'snap/snapshot.json', data)
+        self.tmux.call('rename-session', '-t', '=' + base + '~1', base + '~8')
+        self.tmux.call('kill-session', '-t', '=' + base)
+        self.tmux.call('kill-session', '-t', '=missing')
+        existing = self.tmux.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}')
+        with mock.patch.object(t, 'start_pm', side_effect=AssertionError('existing PM must not restart')):
+            t.restore(self.tmux, self.root / 'snap', data, skip_existing=True)
+        self.assertEqual(self.tmux.call('list-sessions', '-F', '#{session_name}').splitlines(), ['missing', base + '~8'])
+        self.assertEqual(self.tmux.call('list-panes', '-t', '=' + base + '~8', '-F', '#{pane_id}|#{pane_pid}'), existing)
+
     def test_simultaneous_restore_refuses_without_creating_sessions(self):
         data = self.snapshot()
         self.tmux.call('kill-server')
@@ -750,7 +919,8 @@ class IntegrationTests(unittest.TestCase):
         # Model a server that passed preflight but fails when the pane launches.
         with mock.patch.dict(os.environ, {'HOME': str(shell_home), 'INPUTRC': '/dev/null'}), \
              mock.patch.object(t, 'probe_remote'):
-            t.restore(self.tmux, self.root / 'snap', data)
+            t.restore(self.tmux, self.root / 'snap', data, skip_codex_update=True)
+        argv = t.restore_argv(pane['restore'])
         expected = shlex.join(argv)
         def screen():
             return self.tmux.call('capture-pane', '-p', '-J', '-t', 'work:0')
@@ -1021,6 +1191,42 @@ class MultiServerTests(unittest.TestCase):
         self.assertEqual(self.tmux.call('list-sessions', allow_fail=True), '')
         self.assertEqual(self.named.call('list-sessions', '-F', '#{session_name}'), 'work')
 
+    def test_skip_existing_cli_filters_per_server_before_remote_preflight(self):
+        path, _, parts = self.save()
+        existing_path, existing_data = parts[0]
+        pane = next(iter(existing_data['windows'].values()))['panes'][0]
+        pane['restore'] = dict(kind='codex', cwd='/missing/ignored-directory',
+                               argv=['codex', 'resume', 'test-thread', '--remote', 'unix:///missing.sock'])
+        t.write_json(existing_path / 'snapshot.json', existing_data)
+        self.named.call('kill-server')
+        before = self.tmux.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}')
+        with mock.patch.object(t, 'probe_remote', side_effect=AssertionError('skipped remote must not be probed')), \
+             mock.patch.object(t, 'latest_codex_version', side_effect=AssertionError('skipped Codex must not be checked')):
+            preview = self.cli('restore', path, '--skip-existing', '--dry-run')
+            self.assertIn('Skipping work', preview)
+            self.assertEqual(self.named.call('list-sessions', allow_fail=True), '')
+            self.cli('restore', path, '--skip-existing')
+            self.assertIn('No missing sessions', self.cli('restore', path, '--skip-existing'))
+        self.assertEqual(self.named.call('list-sessions', '-F', '#{session_name}'), 'work')
+        self.assertEqual(self.tmux.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}'), before)
+
+    def test_skip_existing_still_blocks_all_missing_sessions_when_remote_is_offline(self):
+        self.named.call('new-session', '-d', '-s', 'missing', '/bin/bash --noprofile --norc')
+        path, _, parts = self.save()
+        remote_path, remote_data = parts[0]
+        pane = next(iter(remote_data['windows'].values()))['panes'][0]
+        pane['restore'] = dict(kind='codex', cwd=str(self.root),
+                               argv=['codex', 'resume', 'test-thread', '--remote', 'unix://' + str(self.root / 'offline.sock')])
+        t.write_json(remote_path / 'snapshot.json', remote_data)
+        self.tmux.call('kill-server')
+        self.named.call('kill-session', '-t', '=missing')
+        before = self.named.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}')
+        with self.assertRaisesRegex(RuntimeError, 'nothing restored'):
+            self.cli('restore', path, '--skip-existing')
+        self.assertEqual(self.tmux.call('list-sessions', allow_fail=True), '')
+        self.assertEqual(self.named.call('list-sessions', '-F', '#{session_name}'), 'work')
+        self.assertEqual(self.named.call('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}'), before)
+
     def test_remote_preflight_blocks_all_servers_then_allows_retry(self):
         path, _, parts = self.save()
         remote_path, remote_data = parts[1]
@@ -1040,9 +1246,55 @@ class MultiServerTests(unittest.TestCase):
             t.restore_all(parts[:1])
         self.sources[0].call('kill-server')
         with remote_listener(self.root / 'unavailable.sock'):
-            self.cli('restore', path)
+            self.cli('restore', path, '--skip-codex-update')
         for tmux in self.sources:
             self.assertEqual(tmux.call('list-sessions', '-F', '#{session_name}'), 'work')
+
+    def test_update_preflight_blocks_all_servers_and_bypass_suppresses_pane_prompts(self):
+        path, _, parts = self.save()
+        home = self.root / 'codex-home'
+        home.mkdir()
+        config = home / 'config.toml'
+        config.write_text('check_for_update_on_startup = true\n')
+        t.write_json(home / 'version.json', dict(latest_version='1.2.1',
+                     last_checked_at=t.dt.datetime.now(t.dt.timezone.utc).isoformat()))
+        client = self.root / 'codex'
+        marker = self.root / 'codex-started.json'
+        def install(version):
+            client.write_text('#!/usr/bin/env python3\nimport json,sys,time\nfrom pathlib import Path\n'
+                              f'if sys.argv[1:]==["--version"]: print("codex-cli {version}"); sys.exit(0)\n'
+                              f'Path({str(marker)!r}).write_text(json.dumps(sys.argv[1:]))\ntime.sleep(120)\n')
+            client.chmod(0o755)
+        install('1.2.0')
+        part_path, data = parts[1]
+        pane = next(iter(data['windows'].values()))['panes'][0]
+        pane['restore'] = dict(kind='codex', cwd=str(self.root), env={'CODEX_HOME': str(home)},
+                               argv=[str(client), 'resume', 'saved-conversation', '-c', 'check_for_update_on_startup=true'])
+        t.write_json(part_path / 'snapshot.json', data)
+        snapshot_bytes = (part_path / 'snapshot.json').read_bytes()
+        for tmux in self.sources:
+            tmux.call('kill-server')
+        for flags in [[], ['--dry-run']]:
+            with self.assertRaisesRegex(RuntimeError, '1.2.0 -> 1.2.1'):
+                self.cli('restore', path, *flags)
+            for tmux in self.sources:
+                self.assertEqual(tmux.call('list-sessions', allow_fail=True), '')
+            self.assertFalse(marker.exists())
+        self.cli('restore', path, '--skip-codex-update')
+        eventually(marker.exists)
+        actual = json.loads(marker.read_text())
+        self.assertEqual(actual, pane['restore']['argv'][1:] + ['-c', 'check_for_update_on_startup=false'])
+        self.assertEqual((part_path / 'snapshot.json').read_bytes(), snapshot_bytes)
+        self.assertEqual(config.read_text(), 'check_for_update_on_startup = true\n')
+        # Simulating installation clears the gate without requiring the bypass.
+        for tmux in self.sources:
+            tmux.call('kill-server')
+        marker.unlink()
+        install('1.2.1')
+        self.cli('restore', path)
+        eventually(marker.exists)
+        self.assertEqual(json.loads(marker.read_text()), actual)
+        self.assertEqual(config.read_text(), 'check_for_update_on_startup = true\n')
 
     def test_later_build_failure_rolls_back_other_servers_before_launch(self):
         path, _, parts = self.save()

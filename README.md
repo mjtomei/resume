@@ -50,6 +50,8 @@ tmux-resume save --close         # checkpoint twice, then close if checks pass
 tmux-resume save --force-close   # checkpoint twice, then close despite pane blockers
 tmux-resume restore --dry-run    # inspect planned commands and duplicate guards
 tmux-resume restore              # restore to each server's original socket
+tmux-resume restore --skip-existing # restore missing sessions; leave existing ones alone
+tmux-resume restore --skip-codex-update # bypass the update check and suppress Codex update dialogs
 tmux-resume show                 # summarize the latest checkpoint
 tmux-resume history              # list older checkpoints and their restore paths
 ```
@@ -194,7 +196,7 @@ group; closing one group member may leave its windows running through another.
 
 ### Already-running protection
 
-Restore refuses the entire selected operation before creating panes if:
+By default, restore refuses the entire selected operation before creating panes if:
 
 - Any requested session name already exists on the destination server.
 - A PM workspace or any of its attachment sessions is already there.
@@ -204,6 +206,28 @@ Restore refuses the entire selected operation before creating panes if:
 - A matching Claude/Codex conversation is found in another live tmux pane owned
   by your user, including on another socket. An unidentified agent of the same
   family in the same directory also blocks restore when a duplicate is possible.
+
+To restore the missing sessions from a checkpoint while keeping sessions that
+are already running, use:
+
+```sh
+tmux-resume restore --skip-existing --dry-run
+tmux-resume restore --skip-existing
+tmux-resume restore /path/to/checkpoint --skip-existing --session work --session notes
+```
+
+`--skip-existing` reports and skips names already present on each destination
+server. It also skips a workspace that restore receipts identify as already
+restored, even if renamed or running on another socket. If a PM base session or
+any attachment is present, the whole PM workspace is skipped. If everything is
+already present, the command succeeds without changing any sessions.
+
+Only the remaining sessions undergo remote-server, Codex update, and launch preflight checks.
+Other protections still apply: a missing session cannot start an agent
+conversation that is already running elsewhere, and a failed check prevents all
+remaining sessions from being created. This flag does not fill in missing
+windows or panes inside an existing session, or merge its windows with a newly
+restored session. It works with server/session selectors and `--dry-run`.
 
 All selected servers pass remote Codex readiness, duplicate, directory,
 executable, and editor-file checks before any workspace is created. Structures
@@ -352,6 +376,35 @@ remote-control server, run `codex remote-control start`, then rerun the same
 addresses are checked using the saved connection settings. Each connection has
 a three-second socket timeout. `restore --dry-run` performs this check too;
 `show` can inspect a checkpoint while its remote servers are offline.
+
+Restore also checks the installed Codex executable for each selected Codex
+session, including remote sessions. If an update is available, it exits before
+creating any tmux or PM sessions. Install it with `codex update` (or your package
+manager), then rerun restore. This checks the local client; it does not update or
+restart a remote-control server.
+
+The check uses Codex's `version.json` in each saved `CODEX_HOME` (normally
+`~/.codex`). Metadata less than 20 hours old is reused. Otherwise, restore queries
+the official GitHub stable release endpoint once per Codex home, with a
+three-second network timeout. If that fails, it warns and uses any usable cached
+version. Without usable metadata, or if the installed version cannot be checked,
+restore refuses to proceed. Custom or prerelease version strings require the
+explicit bypass below. `--dry-run` performs the same checks; `show` stays offline.
+
+To resume without installing an update or checking update availability:
+
+```sh
+tmux-resume restore --skip-codex-update
+# Can also be combined with --skip-existing, --session, or --dry-run.
+```
+
+After the central check passes, or when using this bypass, automatic Codex
+launches append `-c check_for_update_on_startup=false`. This supported
+[Codex setting](https://developers.openai.com/codex/config-reference/)
+prevents each pane from asking to update, including if update metadata changes
+during restore. Prepared retry commands retain it. Saved checkpoint commands
+and your global Codex configuration are unchanged. The bypass leaves the remote
+connection and duplicate-session protections enabled.
 
 If a server stops after preflight, or another resume error occurs, the pane
 displays the program's error and prepares the exact resume command for retry
